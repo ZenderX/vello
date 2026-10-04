@@ -228,6 +228,10 @@ impl CommandBucketer {
         self.rows.as_slice()
     }
 
+    pub(crate) fn rows_mut(&mut self) -> &mut [RowState] {
+        self.rows.as_mut_slice()
+    }
+
     pub(crate) fn width(&self) -> u16 {
         self.clip_bboxes[0].width()
     }

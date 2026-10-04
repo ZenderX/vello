@@ -5,6 +5,7 @@ use crate::Level;
 use crate::dispatch::multi_threaded::{
     RecordedCommand, RecordedCommandSender, RecordedCommandTask, RenderTask, RenderTaskType,
 };
+use crate::dispatch::trim::trim_to_mark;
 use std::vec::Vec;
 use vello_common::clip::PathDataRef;
 use vello_common::geometry::RectU16;
@@ -38,8 +39,10 @@ impl Worker {
         self.thread_id
     }
 
-    pub(crate) fn reset(&mut self, width: u16, height: u16) {
+    /// Reset between frames, trimming the strip buffer this worker holds to `strips_mark`.
+    pub(crate) fn reset(&mut self, width: u16, height: u16, strips_mark: usize) {
         self.strip_generator.reset(width, height);
+        trim_to_mark(&mut self.strip_storage.strips, strips_mark);
     }
 
     pub(crate) fn run_render_task(

@@ -4,6 +4,7 @@
 use crate::coarse::CommandBucketer;
 use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
+use crate::dispatch::trim::SceneMarks;
 use crate::filter::context::FilterContext;
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, Rect, Stroke};
@@ -37,6 +38,8 @@ pub(crate) struct SingleThreadedDispatcher {
     recorder: CommandRecorder<RecordedFill>,
     /// Storage for generated strips and alpha coverage data.
     strip_storage: StripStorage,
+    /// Recent use of the buffers that hold one frame's recorded scene.
+    scene_marks: SceneMarks,
     /// SIMD level for fearless SIMD dispatch.
     level: Level,
 }
@@ -54,6 +57,7 @@ impl SingleThreadedDispatcher {
             viewport: ViewportState::new(width, height, level),
             recorder: CommandRecorder::new(width, height),
             strip_storage: StripStorage::new(GenerationMode::Append),
+            scene_marks: SceneMarks::default(),
             level,
         }
     }
@@ -402,6 +406,12 @@ impl Dispatcher for SingleThreadedDispatcher {
     }
 
     fn reset(&mut self, width: u16, height: u16) {
+        // The scene buffers still hold the last frame here, so their use is measurable.
+        self.scene_marks.end_frame(
+            &mut self.recorder,
+            &mut self.strip_storage,
+            self.bucketer.get_mut(),
+        );
         // Bucketer will be reset on demand, so no need to reset it here.
         self.recorder.reset(width, height);
         self.strip_storage.clear();
@@ -532,8 +542,9 @@ fn save_filtered_layer_debug(pixmap: &Pixmap, layer_id: usize) {
 mod tests {
     use super::*;
     use crate::kurbo::Shape;
+    use alloc::vec::Vec;
     use vello_common::color::palette::css::BLUE;
-    use vello_common::paint::PremulColor;
+    use vello_common::paint::{NoOpImageResolver, PremulColor};
 
     /// Verifies that `reset()` properly clears all internal buffers and state.
     ///
@@ -566,5 +577,90 @@ mod tests {
         assert!(dispatcher.recorder.nodes.is_empty());
         assert!(dispatcher.recorder.layers.is_empty());
         assert!(!dispatcher.viewport.has_root_viewports());
+    }
+
+    /// Bytes of capacity the dispatcher's recorded scene, strips, alphas and buckets retain.
+    fn retained_bytes(dispatcher: &SingleThreadedDispatcher) -> usize {
+        fn bytes<T>(buf: &Vec<T>) -> usize {
+            buf.capacity() * size_of::<T>()
+        }
+        let recorder = &dispatcher.recorder;
+        let strip_storage = &dispatcher.strip_storage;
+        let bucketer = dispatcher.bucketer.borrow();
+        bytes(&recorder.nodes)
+            + bytes(&recorder.draws)
+            + bytes(&recorder.layers)
+            + bytes(&strip_storage.strips)
+            + bytes(&strip_storage.alphas)
+            + bytes(&bucketer.paint_fill_attrs)
+            + bucketer
+                .rows()
+                .iter()
+                .map(|row| bytes(&row.render_cmds) + bytes(&row.depth_cmds))
+                .sum::<usize>()
+    }
+
+    /// A long-lived page must not keep its heaviest frame's scene buffers for good: once
+    /// frames turn light, they shrink back.
+    #[test]
+    fn buffers_shrink_after_a_heavy_frame() {
+        const SIZE: u16 = 64;
+        let mut dispatcher = SingleThreadedDispatcher::new(SIZE, SIZE, Level::new());
+        let mut target = Pixmap::new(SIZE, SIZE);
+        let paint = Paint::Solid(PremulColor::from_alpha_color(BLUE));
+        let fill = |dispatcher: &mut SingleThreadedDispatcher, path: &BezPath| {
+            dispatcher.fill_path(
+                path,
+                Fill::NonZero,
+                Affine::IDENTITY,
+                paint.clone(),
+                BlendMode::default(),
+                None,
+                None,
+            );
+        };
+        let mut end_frame = |dispatcher: &mut SingleThreadedDispatcher| {
+            dispatcher.rasterize(
+                (&mut target).into(),
+                SIZE,
+                SIZE,
+                RasterizerSettings::default(),
+                &[],
+                &NoOpImageResolver,
+            );
+            dispatcher.reset(SIZE, SIZE);
+        };
+
+        // A zig-zag across the whole target: thousands of segments, every tile row covered.
+        let mut heavy = BezPath::new();
+        heavy.move_to((0.0, 0.0));
+        for i in 0..4000 {
+            let x = f64::from(i % 2) * f64::from(SIZE);
+            heavy.line_to((x, f64::from(i) * f64::from(SIZE) / 4000.0));
+        }
+        heavy.close_path();
+        let light = Rect::new(0.0, 0.0, 8.0, 8.0).to_path(0.1);
+
+        for _ in 0..64 {
+            fill(&mut dispatcher, &heavy);
+        }
+        // Many small draws, so the recorded scene and the buckets are heavy too.
+        for _ in 0..20_000 {
+            fill(&mut dispatcher, &light);
+        }
+        end_frame(&mut dispatcher);
+        let after_heavy = retained_bytes(&dispatcher);
+
+        // About seven half-lives of the usage marks.
+        for _ in 0..20_000 {
+            fill(&mut dispatcher, &light);
+            end_frame(&mut dispatcher);
+        }
+        let after_light = retained_bytes(&dispatcher);
+
+        assert!(
+            after_light * 10 < after_heavy,
+            "retained {after_light} B after light frames, {after_heavy} B after the heavy one"
+        );
     }
 }

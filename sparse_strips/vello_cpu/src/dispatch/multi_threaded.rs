@@ -6,6 +6,7 @@ use crate::coarse::depth::DepthBuffer;
 use crate::dispatch::Dispatcher;
 use crate::dispatch::multi_threaded::cost::{COST_THRESHOLD, estimate_render_task_cost};
 use crate::dispatch::multi_threaded::worker::Worker;
+use crate::dispatch::trim::{SceneMarks, UsageMark, trim_to_mark};
 use crate::filter::context::FilterContext;
 use crate::fine::{Fine, FineKernel, FineRenderParams, FineResources, rasterize_region};
 use crate::kurbo::{Affine, BezPath, PathEl, Point, Rect, Stroke};
@@ -59,6 +60,8 @@ pub(crate) struct MultiThreadedDispatcher {
     clip_context: ClipContext,
     recorder: CommandRecorder<RecordedFill>,
     strip_storage: StripStorage,
+    /// Recent use of the buffers that hold one frame's recorded scene.
+    scene_marks: SceneMarks,
     /// The thread pool that is used for dispatching tasks.
     thread_pool: ThreadPool,
     allocation_group: AllocationGroup,
@@ -96,6 +99,8 @@ pub(crate) struct MultiThreadedDispatcher {
     /// the slots are put back into the `MaybePresent` object.
     ///
     alpha_storage: MaybePresent<Vec<Vec<u8>>>,
+    /// The most alphas one thread produced in recent frames.
+    alpha_mark: UsageMark,
     /// The task index that will be assigned to the next rendering task.
     ///
     /// Since we are rendering the paths on different threads, we need to make sure that they
@@ -153,8 +158,10 @@ impl MultiThreadedDispatcher {
             recorded_command_receiver: None,
             strip_generator: StripGenerator::new(width, height, level),
             strip_storage: StripStorage::new(GenerationMode::Append),
+            scene_marks: SceneMarks::default(),
             level,
             alpha_storage,
+            alpha_mark: UsageMark::default(),
             num_threads,
             layer_depth: 0,
         }
@@ -262,6 +269,16 @@ impl MultiThreadedDispatcher {
 
     fn send_pending_tasks(&mut self) {
         let task_idx = self.bump_task_idx();
+        // Workers drain `render_tasks`, so its use is only visible here.
+        let allocations = &mut self.allocations;
+        allocations
+            .paths
+            .used
+            .record(self.allocation_group.path.len());
+        allocations
+            .render_tasks
+            .used
+            .record(self.allocation_group.render_tasks.len());
         let allocation_group =
             std::mem::replace(&mut self.allocation_group, self.allocations.get());
         let task_sender = self.task_sender.as_mut().unwrap();
@@ -304,6 +321,12 @@ impl MultiThreadedDispatcher {
             match self.recorded_command_receiver.as_mut().unwrap().try_recv() {
                 Ok(mut task) => {
                     let num_tasks = task.allocation_group.recorded_commands.len();
+                    let allocations = &mut self.allocations;
+                    allocations.recorded_commands.used.record(num_tasks);
+                    allocations
+                        .strips
+                        .used
+                        .record(task.allocation_group.strips.len());
                     for cmd in task.allocation_group.recorded_commands.drain(0..num_tasks) {
                         match cmd {
                             RecordedCommand::RenderPath {
@@ -587,20 +610,33 @@ impl Dispatcher for MultiThreadedDispatcher {
     fn reset(&mut self, width: u16, height: u16) {
         self.flush();
 
+        // The scene buffers still hold the last frame here, so their use is measurable.
+        self.scene_marks.end_frame(
+            &mut self.recorder,
+            &mut self.strip_storage,
+            self.bucketer.get_mut().unwrap(),
+        );
         // Bucketer will be reset lazily during rasterization with the active viewport.
         self.clip_context.reset();
         self.recorder.reset(width, height);
         self.strip_storage.clear();
         self.allocation_group.clear();
+        let strips_mark = self.allocations.end_frame(&mut self.allocation_group);
         self.batch_cost = 0.0;
         self.task_idx = 0;
         self.layer_depth = 0;
         self.task_sender = None;
         self.recorded_command_receiver = None;
         self.strip_generator.reset(width, height);
+        let alpha_mark = &mut self.alpha_mark;
         self.alpha_storage.with_inner(|alphas| {
+            for alpha in alphas.iter() {
+                alpha_mark.record(alpha.len());
+            }
+            let mark = alpha_mark.end_frame();
             for alpha in alphas {
                 alpha.clear();
+                trim_to_mark(alpha, mark);
             }
         });
 
@@ -612,7 +648,7 @@ impl Dispatcher for MultiThreadedDispatcher {
         self.thread_pool.spawn_broadcast(move |_| {
             let worker = workers.get().unwrap();
             let mut borrowed = worker.borrow_mut();
-            borrowed.reset(width, height);
+            borrowed.reset(width, height, strips_mark);
             t_barrier.wait();
         });
 
@@ -749,6 +785,8 @@ pub(crate) struct OwnedClip {
 /// A structure that allows storing and fetching existing allocations.
 struct AllocationManager<T> {
     entries: Vec<Vec<T>>,
+    /// The most elements one allocation held in recent frames.
+    used: UsageMark,
 }
 
 impl<T> AllocationManager<T> {
@@ -764,11 +802,24 @@ impl<T> AllocationManager<T> {
         allocation.clear();
         self.entries.push(allocation);
     }
+
+    /// Keep at most `depth` allocations, trim each to the decayed usage mark, and return the mark.
+    fn end_frame(&mut self, depth: usize) -> usize {
+        let mark = self.used.end_frame();
+        self.entries.truncate(depth);
+        for entry in &mut self.entries {
+            trim_to_mark(entry, mark);
+        }
+        mark
+    }
 }
 
 impl<T> Default for AllocationManager<T> {
     fn default() -> Self {
-        Self { entries: vec![] }
+        Self {
+            entries: vec![],
+            used: UsageMark::default(),
+        }
     }
 }
 
@@ -787,6 +838,10 @@ struct Allocations {
     strips: AllocationManager<Strip>,
     /// The commands produced by a worker thread, which will be recorded by the main thread.
     recorded_commands: AllocationManager<RecordedCommand>,
+    /// The number of groups handed out and not yet put back.
+    in_flight: usize,
+    /// The most groups in flight at once in recent frames: the pool depth they needed.
+    depth: UsageMark,
 }
 
 impl Allocations {
@@ -794,6 +849,8 @@ impl Allocations {
     ///
     /// The group is guaranteed to have been cleared.
     fn get(&mut self) -> AllocationGroup {
+        self.in_flight += 1;
+        self.depth.record(self.in_flight);
         let render_tasks = self.render_tasks.get();
         let path = self.paths.get();
         let strips = self.strips.get();
@@ -808,10 +865,31 @@ impl Allocations {
     }
 
     fn put(&mut self, allocation: AllocationGroup) {
+        self.in_flight = self.in_flight.saturating_sub(1);
         self.render_tasks.put(allocation.render_tasks);
         self.paths.put(allocation.path);
         self.strips.put(allocation.strips);
         self.recorded_commands.put(allocation.recorded_commands);
+    }
+
+    /// Between frames, drop pooled groups beyond the recent in-flight peak and trim the rest,
+    /// `current` included, to recent use.
+    ///
+    /// Returns the strip mark, which each worker applies to the strip buffer it holds.
+    fn end_frame(&mut self, current: &mut AllocationGroup) -> usize {
+        let depth = self.depth.end_frame();
+        trim_to_mark(&mut current.path, self.paths.end_frame(depth));
+        trim_to_mark(
+            &mut current.render_tasks,
+            self.render_tasks.end_frame(depth),
+        );
+        trim_to_mark(
+            &mut current.recorded_commands,
+            self.recorded_commands.end_frame(depth),
+        );
+        let strips_mark = self.strips.end_frame(depth);
+        trim_to_mark(&mut current.strips, strips_mark);
+        strips_mark
     }
 }
 
@@ -943,9 +1021,10 @@ mod tests {
     use crate::Level;
     use crate::color::palette::css::BLUE;
     use crate::dispatch::Dispatcher;
-    use crate::dispatch::multi_threaded::MultiThreadedDispatcher;
-    use crate::kurbo::{Affine, Rect, Shape};
+    use crate::dispatch::multi_threaded::{AllocationGroup, MultiThreadedDispatcher};
+    use crate::kurbo::{Affine, BezPath, Rect, Shape};
     use crate::peniko::{BlendMode, Fill};
+    use alloc::vec::Vec;
     use vello_common::paint::{Paint, PremulColor};
 
     /// Ensure we don't cause a memory leak.
@@ -969,5 +1048,100 @@ mod tests {
         assert_eq!(dispatcher.allocations.strips.entries.len(), 1);
         assert_eq!(dispatcher.allocations.render_tasks.entries.len(), 1);
         assert_eq!(dispatcher.allocations.recorded_commands.entries.len(), 1);
+    }
+
+    /// Bytes of capacity the dispatcher's pooled, current, strip and alpha buffers retain.
+    fn retained_bytes(dispatcher: &MultiThreadedDispatcher) -> usize {
+        fn bytes<T>(buf: &Vec<T>) -> usize {
+            buf.capacity() * size_of::<T>()
+        }
+        fn group_bytes(group: &AllocationGroup) -> usize {
+            bytes(&group.path)
+                + bytes(&group.render_tasks)
+                + bytes(&group.strips)
+                + bytes(&group.recorded_commands)
+        }
+        let pool = &dispatcher.allocations;
+        let pooled: usize = pool.paths.entries.iter().map(bytes).sum::<usize>()
+            + pool.render_tasks.entries.iter().map(bytes).sum::<usize>()
+            + pool.strips.entries.iter().map(bytes).sum::<usize>()
+            + pool
+                .recorded_commands
+                .entries
+                .iter()
+                .map(bytes)
+                .sum::<usize>();
+        let mut alphas = 0;
+        dispatcher
+            .alpha_storage
+            .with_inner(|slots| alphas = slots.iter().map(bytes).sum());
+        let recorder = &dispatcher.recorder;
+        let scene = bytes(&recorder.nodes)
+            + bytes(&recorder.draws)
+            + bytes(&recorder.layers)
+            + bytes(&dispatcher.strip_storage.strips);
+        let bucketer = dispatcher.bucketer.lock().unwrap();
+        let bucketed = bytes(&bucketer.paint_fill_attrs)
+            + bucketer
+                .rows()
+                .iter()
+                .map(|row| bytes(&row.render_cmds) + bytes(&row.depth_cmds))
+                .sum::<usize>();
+        pooled + group_bytes(&dispatcher.allocation_group) + alphas + scene + bucketed
+    }
+
+    /// A long-lived page must not keep its heaviest frame's raster buffers for
+    /// good: once frames turn light, the pool and alpha buffers shrink back.
+    #[test]
+    fn buffers_shrink_after_a_heavy_burst() {
+        const SIZE: u16 = 256;
+        let mut dispatcher = MultiThreadedDispatcher::new(SIZE, SIZE, 4, Level::new());
+        let paint = Paint::Solid(PremulColor::from_alpha_color(BLUE));
+        let fill = |dispatcher: &mut MultiThreadedDispatcher, path: &BezPath| {
+            dispatcher.fill_path(
+                path,
+                Fill::NonZero,
+                Affine::IDENTITY,
+                paint.clone(),
+                BlendMode::default(),
+                None,
+                None,
+            );
+        };
+
+        // A zig-zag across the whole target: thousands of segments, every tile row covered.
+        let mut heavy = BezPath::new();
+        heavy.move_to((0.0, 0.0));
+        for i in 0..4000 {
+            let x = f64::from(i % 2) * f64::from(SIZE);
+            heavy.line_to((x, f64::from(i) * f64::from(SIZE) / 4000.0));
+        }
+        heavy.close_path();
+        let light = Rect::new(0.0, 0.0, 8.0, 8.0).to_path(0.1);
+
+        dispatcher.reset(SIZE, SIZE);
+        for _ in 0..64 {
+            fill(&mut dispatcher, &heavy);
+        }
+        // Many small draws, so the recorded scene is heavy too.
+        for _ in 0..20_000 {
+            fill(&mut dispatcher, &light);
+        }
+        dispatcher.flush();
+        dispatcher.reset(SIZE, SIZE);
+        let after_heavy = retained_bytes(&dispatcher);
+
+        // About seven half-lives of the usage marks.
+        for _ in 0..20_000 {
+            fill(&mut dispatcher, &light);
+            dispatcher.flush();
+            dispatcher.reset(SIZE, SIZE);
+        }
+        let after_light = retained_bytes(&dispatcher);
+
+        assert!(
+            after_light * 10 < after_heavy,
+            "retained {after_light} B after light frames, {after_heavy} B after the heavy one"
+        );
     }
 }
