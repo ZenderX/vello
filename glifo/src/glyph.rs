@@ -14,8 +14,8 @@ use crate::atlas::AtlasSlot;
 use crate::atlas::GlyphCacheKey;
 use crate::atlas::key::{SUBPIXEL_BITMAP, SUBPIXEL_COLR, pack_color};
 use crate::atlas::{GlyphAtlas, ImageCache};
-use crate::color::PremulRgba8;
 use crate::color::palette::css::BLACK;
+use crate::color::{AlphaColor, PremulRgba8, Srgb};
 use crate::colr::{convert_bounding_box, get_colr_info};
 use crate::kurbo::Point;
 use crate::kurbo::Rect;
@@ -219,6 +219,10 @@ pub struct GlyphColr<'a> {
     pub pix_height: u16,
     /// Whether the glyph paint graph uses a non-default blend mode.
     pub has_non_default_blend: bool,
+    /// The CPAL palette the glyph's colors come from.
+    pub(crate) palette_index: u16,
+    /// Palette entries drawn in another color, as `(entry index, color)`.
+    pub(crate) palette_overrides: &'a [(u16, AlphaColor<Srgb>)],
 }
 
 impl Debug for GlyphColr<'_> {
@@ -377,6 +381,8 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
             font_embolden,
             normalized_coords,
             hinting_instance,
+            palette_index,
+            palette_overrides,
             ..
         } = self.prepared_run;
 
@@ -386,6 +392,9 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
             .atlas_cacher
             .config()
             .is_some_and(|config| draw_props.font_size <= config.max_cached_font_size);
+        // The cache key holds no palette, so only default-palette COLR glyphs are cached.
+        let colr_cache_enabled =
+            colr_bitmap_cache_enabled && palette_index == 0 && palette_overrides.is_empty();
         let outline_cache_enabled = colr_bitmap_cache_enabled
             // Due to the various parameters that would need to be considered in the cache key,
             // we never cache stroked outlines for now. For COLR and bitmap, this doesn't matter
@@ -465,7 +474,7 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
 
                 // COLR glyphs are never hinted and have no sub-pixel offset;
                 // context_color is part of the key because it affects painted layers.
-                let cache_key = colr_bitmap_cache_enabled.then(|| GlyphCacheKey {
+                let cache_key = colr_cache_enabled.then(|| GlyphCacheKey {
                     font_id: font_info.id,
                     font_index: font_info.index,
                     glyph_id: glyph.id,
@@ -508,6 +517,8 @@ impl<'a, 'b, Glyphs: Iterator<Item = Glyph> + Clone> GlyphRunRenderer<'a, 'b, Gl
                     color_glyph,
                     normalized_coords,
                     font_info,
+                    palette_index,
+                    palette_overrides,
                 );
 
                 let prepared_glyph = PreparedGlyph {
@@ -870,6 +881,8 @@ impl<'a, B> GlyphRunBuilder<'a, B> {
                 glyph_transform: None,
                 hint: true,
                 normalized_coords: &[],
+                palette_index: 0,
+                palette_overrides: &[],
             },
             backend,
         }
@@ -906,6 +919,17 @@ impl<'a, B> GlyphRunBuilder<'a, B> {
     /// Set normalized variation coordinates for variable fonts.
     pub fn normalized_coords(mut self, coords: &'a [NormalizedCoord]) -> Self {
         self.run.normalized_coords = bytemuck::cast_slice(coords);
+        self
+    }
+
+    /// Select the CPAL palette COLR glyphs are painted with, and replace some of its
+    /// entries with other colors, as `(entry index, color)`; a later override of an
+    /// entry wins.
+    ///
+    /// An index past the font's palettes selects palette 0, the default.
+    pub fn palette(mut self, index: u16, overrides: &'a [(u16, AlphaColor<Srgb>)]) -> Self {
+        self.run.palette_index = index;
+        self.run.palette_overrides = overrides;
         self
     }
 }
@@ -1373,6 +1397,8 @@ fn create_colr_glyph<'a>(
     color_glyph: skrifa::color::ColorGlyph<'a>,
     normalized_coords: &'a [skrifa::instance::NormalizedCoord],
     font_info: FontInfo,
+    palette_index: u16,
+    palette_overrides: &'a [(u16, AlphaColor<Srgb>)],
 ) -> GlyphType<'a> {
     let (pix_width, pix_height) = (
         metrics.scaled_bbox.width().ceil() as u16,
@@ -1407,6 +1433,8 @@ fn create_colr_glyph<'a>(
         draw_transform,
         has_non_default_blend: metrics.has_non_default_blend,
         font_info,
+        palette_index,
+        palette_overrides,
     }))
 }
 
@@ -1449,6 +1477,10 @@ pub struct GlyphRun<'a> {
     normalized_coords: &'a [skrifa::instance::NormalizedCoord],
     /// Controls whether font hinting is enabled.
     hint: bool,
+    /// The CPAL palette COLR glyphs take their colors from.
+    palette_index: u16,
+    /// Palette entries drawn in another color, as `(entry index, color)`.
+    palette_overrides: &'a [(u16, AlphaColor<Srgb>)],
 }
 
 struct PreparedGlyphRun<'a> {
@@ -1490,6 +1522,8 @@ struct PreparedGlyphRun<'a> {
     scene_paint_transform: Affine,
     normalized_coords: &'a [skrifa::instance::NormalizedCoord],
     hinting_instance: Option<&'a HintingInstance>,
+    palette_index: u16,
+    palette_overrides: &'a [(u16, AlphaColor<Srgb>)],
 }
 
 /// Properties for easily calculating the transform of a positioned glyph.
@@ -1652,6 +1686,8 @@ fn prepare_glyph_run<'a>(run: GlyphRun<'a>, hint_cache: &'a mut HintCache) -> Pr
         scene_paint_transform: run.scene_paint_transform,
         normalized_coords: run.normalized_coords,
         hinting_instance,
+        palette_index: run.palette_index,
+        palette_overrides: run.palette_overrides,
     }
 }
 
@@ -2339,6 +2375,8 @@ mod tests {
             glyph_transform: None,
             normalized_coords: &[],
             hint: false,
+            palette_index: 0,
+            palette_overrides: &[],
         }
         .build(
             core::iter::once(glyph),

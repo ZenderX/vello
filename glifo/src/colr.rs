@@ -128,22 +128,33 @@ impl<'a, 'b> ColrPainter<'a, 'b> {
     }
 
     fn palette_index_to_color(&self, palette_index: u16, alpha: f32) -> Option<AlphaColor<Srgb>> {
-        if palette_index != u16::MAX {
-            let color = self
-                .colr_glyph
-                .font_ref
-                .cpal()
-                .ok()?
-                .color_records_array()?
-                .ok()?[palette_index as usize];
-
-            Some(
-                AlphaColor::from_rgba8(color.red, color.green, color.blue, color.alpha)
-                    .multiply_alpha(alpha),
-            )
-        } else {
-            Some(self.context_color.multiply_alpha(alpha))
+        if palette_index == u16::MAX {
+            return Some(self.context_color.multiply_alpha(alpha));
         }
+        let overridden = self
+            .colr_glyph
+            .palette_overrides
+            .iter()
+            .rev()
+            .find(|(entry, _)| *entry == palette_index);
+        if let Some(&(_, color)) = overridden {
+            return Some(color.multiply_alpha(alpha));
+        }
+        let cpal = self.colr_glyph.font_ref.cpal().ok()?;
+        let first_entries = cpal.color_record_indices();
+        let first_entry = first_entries
+            .get(usize::from(self.colr_glyph.palette_index))
+            .or(first_entries.first())?
+            .get();
+        let color = *cpal
+            .color_records_array()?
+            .ok()?
+            .get(usize::from(first_entry) + usize::from(palette_index))?;
+
+        Some(
+            AlphaColor::from_rgba8(color.red, color.green, color.blue, color.alpha)
+                .multiply_alpha(alpha),
+        )
     }
 
     fn convert_stops(&self, stops: &[ColorStop]) -> ColorStops {
